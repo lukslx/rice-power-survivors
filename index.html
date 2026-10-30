@@ -47,6 +47,10 @@
     font-weight: bold; font-size: 12px; letter-spacing: 1px; text-align: center;
   }
   .tbtn.pressed { background: rgba(255,255,255,0.42); }
+  /* i pulsanti compaiono solo in partita: DASH durante il gioco, pausa anche nel menu di pausa */
+  .tbtn { display: none; }
+  #touch.play #btnDash.dashon { display: flex; }
+  #touch.play #btnPause, #touch.paused #btnPause { display: flex; }
   #btnDash {
     right: calc(26px + env(safe-area-inset-right, 0px)); bottom: calc(30px + env(safe-area-inset-bottom, 0px));
     width: 98px; height: 98px; background: rgba(120,190,255,0.20); border-color: rgba(150,210,255,0.6);
@@ -715,7 +719,7 @@ window.addEventListener('keyup', e => {
 });
 window.addEventListener('blur', () => {
   for (const k in Input.down) Input.down[k] = false;
-  Input.joy.active = false;
+  if (typeof Touch !== 'undefined') Touch.endJoy(); else Input.joy.active = false;
   if (typeof G !== 'undefined' && G.state === 'PLAYING') pauseGame();
 });
 
@@ -741,8 +745,9 @@ const Touch = {
     const l = Math.hypot(dx, dy), R = 48;
     if (l > R) { dx = dx / l * R; dy = dy / l * R; }
     this.knob.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
-    const nx = dx / R, ny = dy / R;
-    if (Math.hypot(nx, ny) < 0.16) { Input.joy.x = 0; Input.joy.y = 0; } else { Input.joy.x = nx; Input.joy.y = ny; }
+    // l'input raggiunge la piena velocità già a 30 px di corsa (il pomello scorre fino a 48)
+    const RI = 30, mag = Math.min(1, l / RI), ang = Math.atan2(dy, dx);
+    if (mag < 0.18) { Input.joy.x = 0; Input.joy.y = 0; } else { Input.joy.x = Math.cos(ang) * mag; Input.joy.y = Math.sin(ang) * mag; }
   },
   endJoy() {
     this.joyId = null; Input.joy.active = false; Input.joy.x = 0; Input.joy.y = 0;
@@ -760,7 +765,8 @@ const Touch = {
       const v = toVirtual(e.clientX, e.clientY);
       Pointer.x = v.x; Pointer.y = v.y;
       if (G.state === 'PLAYING' && e.pointerType !== 'mouse') {
-        if (this.joyId === null && e.clientX < window.innerWidth * 0.5) this.startJoy(e);
+        // joystick flottante: parte dove tocca il pollice (i pulsanti DASH/pausa intercettano i loro tocchi)
+        if (this.joyId === null || this.joyId === e.pointerId) this.startJoy(e);
         e.preventDefault();
         return;
       }
@@ -772,9 +778,10 @@ const Touch = {
       Pointer.x = v.x; Pointer.y = v.y; Pointer.moved = true;
       if (e.pointerId === this.joyId) this.moveJoy(e);
     });
-    const up = e => { if (e.pointerId === this.joyId) this.endJoy(); };
+    const up = e => { Sound.init(); Sound.resume(); if (e.pointerId === this.joyId) this.endJoy(); };
     window.addEventListener('pointerup', up);
     window.addEventListener('pointercancel', up);
+    window.addEventListener('touchend', () => { Sound.init(); Sound.resume(); }, { passive: true });
     document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
     const bind = (id, action) => {
       const el = document.getElementById(id);
@@ -782,14 +789,23 @@ const Touch = {
         e.preventDefault(); e.stopPropagation(); Sound.init(); Sound.resume(); this.enable();
         el.classList.add('pressed'); Input.press(action);
       }, { passive: false });
-      const rel = e => { e.stopPropagation(); el.classList.remove('pressed'); Input.release(action); };
+      const rel = e => { el.classList.remove('pressed'); Input.release(action); if (e.pointerId === this.joyId) this.endJoy(); };
       el.addEventListener('pointerup', rel); el.addEventListener('pointercancel', rel); el.addEventListener('pointerleave', rel);
     };
     bind('btnDash', 'dash'); bind('btnPause', 'pause');
+    this.dash = document.getElementById('btnDash');
+  },
+  // mostra i pulsanti solo negli stati in cui servono
+  sync() {
+    if (!this.enabled) return;
+    this.root.classList.toggle('play', G.state === 'PLAYING');
+    this.root.classList.toggle('paused', G.state === 'PAUSED');
+    this.dash.classList.toggle('dashon', !!Opt.dash);
   }
 };
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
+  if (Touch.enabled && h > w && typeof G !== 'undefined' && G.state === 'PLAYING') pauseGame();
   let s = Math.min(w / VW, h / VH);
   if (s >= 2) s = Math.floor(s);
   canvas.style.width = Math.floor(VW * s) + 'px';
@@ -1313,7 +1329,7 @@ function drawTempura(c, x, y, o) {
 const G = {
   state: 'TITLE', t: 0, frame: 0, hitStop: 0, slow: 0, shake: 0,
   fade: 0, fadeDir: 0, fadeCb: null, banner: null, toast: null, quality: 1, fps: 60, fpsAcc: 0, fpsN: 0,
-  retState: 'MENU', story: 0, storyT: 0, storyChar: 0, titleT: 0, ending: false,
+  retState: 'MENU', story: 0, storyT: 0, storyChar: 0, titleT: 0, ending: false, uiLock: 0,
 };
 let run = null;          // dati della partita in corso
 let P = null;            // statistiche aggregate dei passivi
@@ -1339,11 +1355,11 @@ const STAGES = [
   { id: 'citta', name: 'CITTÀ', sub: 'LA FUGA DAL KARAGUASHI', music: 'city', boss: 'maitre',
     bossName: 'IL MAÎTRE FURIOSO', bossSub: 'NESSUNO RESTA SENZA CONTO!', miniType: 'capocameriere', firstWave: 'cittadino', phase: 1,
     spawns: [
-      { type: 'cittadino', a: 0,   b: 900, r0: 0.8,  r1: 3.4 },
-      { type: 'cameriere', a: 80,  b: 900, r0: 0.14, r1: 1.5 },
-      { type: 'gatto',     a: 150, b: 900, r0: 0.15, r1: 1.3 },
-      { type: 'cliente',   a: 230, b: 900, r0: 0.10, r1: 0.8 },
-      { type: 'piccione',  a: 330, b: 900, r0: 0.15, r1: 1.1 },
+      { type: 'cittadino', a: 0,   b: 900, r0: 0.8,  r1: 6.8 },
+      { type: 'cameriere', a: 80,  b: 900, r0: 0.14, r1: 3.0 },
+      { type: 'gatto',     a: 150, b: 900, r0: 0.15, r1: 2.6 },
+      { type: 'cliente',   a: 230, b: 900, r0: 0.10, r1: 1.6 },
+      { type: 'piccione',  a: 330, b: 900, r0: 0.15, r1: 2.2 },
     ],
     // k: line = ondata che attraversa lo schermo, ring = muro che chiude in cerchio, arc = arco che avanza
     events: [
@@ -1361,9 +1377,9 @@ const STAGES = [
   { id: 'risaia', name: 'RISAIA DI MONTAGNA', sub: 'LA FUGA CONTINUA SUI MONTI', music: 'risaia', boss: 'grandorso',
     bossName: 'IL GRANDE ORSO DELLA RISAIA', bossSub: 'QUESTO RISO È MIO!', miniType: 'lupoalfa', firstWave: 'cervo', phase: 2,
     spawns: [
-      { type: 'cervo', a: 0,   b: 900, r0: 0.6,  r1: 2.6 },
-      { type: 'lupo',  a: 70,  b: 900, r0: 0.2,  r1: 2.2 },
-      { type: 'orso',  a: 170, b: 900, r0: 0.08, r1: 0.7 },
+      { type: 'cervo', a: 0,   b: 900, r0: 0.4,  r1: 5.2 },
+      { type: 'lupo',  a: 70,  b: 900, r0: 0.2,  r1: 4.4 },
+      { type: 'orso',  a: 170, b: 900, r0: 0.08, r1: 1.4 },
     ],
     events: [
       { t: 60,  k: 'arc',  type: 'lupo',  n: 10 }, { t: 120, k: 'ring', type: 'cervo', n: 16 },
@@ -1380,9 +1396,9 @@ const STAGES = [
   { id: 'vulcano', name: 'ISOLA DEL VULCANO', sub: 'SABBIA, LAVA E POLLI ARMATI', music: 'vulcano', boss: 'tako',
     bossName: 'TAKO INFERNO', bossSub: 'OGGI SI FRIGGE, PICCOLO NIGIRI!', miniType: 'gallo', firstWave: 'serpente', hazards: true, phase: 3,
     spawns: [
-      { type: 'serpente', a: 0,   b: 900, r0: 0.7,  r1: 2.9 },
-      { type: 'calamaro', a: 80,  b: 900, r0: 0.12, r1: 1.1 },
-      { type: 'pollo',    a: 170, b: 900, r0: 0.1,  r1: 0.9 },
+      { type: 'serpente', a: 0,   b: 900, r0: 0.35, r1: 5.8 },
+      { type: 'calamaro', a: 80,  b: 900, r0: 0.12, r1: 2.2 },
+      { type: 'pollo',    a: 170, b: 900, r0: 0.1,  r1: 1.8 },
     ],
     events: [
       { t: 60,  k: 'arc',  type: 'serpente', n: 10 }, { t: 120, k: 'ring', type: 'serpente', n: 16 },
@@ -1399,10 +1415,10 @@ const STAGES = [
   { id: 'invasa', name: 'CITTÀ INVASA', sub: 'GLI ALIENI HANNO PRENOTATO', music: 'invasa', boss: 'gnamzor',
     bossName: 'IMPERATORE GNAM-ZOR', bossSub: 'IL BUFFET GALATTICO È SERVITO!', miniType: 'hunter', firstWave: 'scout', hazards: true, phase: 4,
     spawns: [
-      { type: 'scout',      a: 0,   b: 900, r0: 0.9,  r1: 3.2 },
-      { type: 'alienlaser', a: 70,  b: 900, r0: 0.12, r1: 1.1 },
-      { type: 'drone',      a: 150, b: 900, r0: 0.12, r1: 1.0 },
-      { type: 'pesante',    a: 220, b: 900, r0: 0.06, r1: 0.6 },
+      { type: 'scout',      a: 0,   b: 900, r0: 0.8,  r1: 4.6 },
+      { type: 'alienlaser', a: 70,  b: 900, r0: 0.12, r1: 1.7 },
+      { type: 'drone',      a: 150, b: 900, r0: 0.12, r1: 1.5 },
+      { type: 'pesante',    a: 220, b: 900, r0: 0.06, r1: 0.9 },
     ],
     events: [
       { t: 60,  k: 'line', type: 'scout',      n: 14 }, { t: 120, k: 'ring', type: 'scout',      n: 20 },
@@ -1417,17 +1433,17 @@ const STAGES = [
     miniNames: ['SUSHI HUNTER', 'SUSHI HUNTER II', 'SUSHI HUNTER III', 'SUSHI HUNTER IV', 'SUSHI HUNTER V'],
   },
   { id: 'karaguashi', name: 'KARAGUASHI', sub: 'LA RESA DEI CONTI FINALE', music: 'karaguashi', boss: 'chef',
-    bossName: 'CHEF KARAGUASHI', bossSub: 'NESSUN SUSHI LASCIA LA MIA CUCINA!', miniType: 'souschef', firstWave: 'aiutocuoco', hazards: true, phase: 5,
+    bossName: 'CHEF KARAGUASHI', bossSub: 'NESSUN SUSHI LASCIA LA MIA CUCINA!', miniType: 'souschef', firstWave: 'cameriere', hazards: true, phase: 5,
     cages: [80, 200, 320, 440, 560, 680],
     spawns: [
-      { type: 'aiutocuoco', a: 0,   b: 900, r0: 0.7,  r1: 2.6 },
-      { type: 'cameriere',  a: 0,   b: 900, r0: 0.3,  r1: 1.2 },
-      { type: 'coltello',   a: 60,  b: 900, r0: 0.2,  r1: 1.6 },
-      { type: 'piatto',     a: 120, b: 900, r0: 0.15, r1: 1.4 },
-      { type: 'lupo',       a: 200, b: 900, r0: 0.1,  r1: 0.9 },
-      { type: 'calamaro',   a: 300, b: 900, r0: 0.08, r1: 0.7 },
-      { type: 'scout',      a: 400, b: 900, r0: 0.1,  r1: 1.0 },
-      { type: 'pesante',    a: 540, b: 900, r0: 0.04, r1: 0.45 },
+      { type: 'aiutocuoco', a: 0,   b: 900, r0: 0.3,  r1: 3.8 },
+      { type: 'cameriere',  a: 0,   b: 900, r0: 0.15, r1: 1.8 },
+      { type: 'coltello',   a: 90,  b: 900, r0: 0.2,  r1: 2.4 },
+      { type: 'piatto',     a: 120, b: 900, r0: 0.15, r1: 2.0 },
+      { type: 'lupo',       a: 200, b: 900, r0: 0.1,  r1: 1.4 },
+      { type: 'calamaro',   a: 300, b: 900, r0: 0.08, r1: 1.1 },
+      { type: 'scout',      a: 400, b: 900, r0: 0.1,  r1: 1.5 },
+      { type: 'pesante',    a: 540, b: 900, r0: 0.04, r1: 0.7 },
     ],
     events: [
       { t: 60,  k: 'arc',  type: 'coltello',   n: 10 }, { t: 120, k: 'ring', type: 'aiutocuoco', n: 16 },
@@ -2604,33 +2620,33 @@ const EDEF = {
   gatto:     { name: 'GATTO RANDAGIO', beh: 'orbiter', hp: 5, spd: 50, dmg: 4, r: 4, xp: 1, spr: 'gatto', cols: ['#9a9aa6', '#e08a3a', '#5ef05e'] },
   cliente:   { name: 'CLIENTE AFFAMATO', beh: 'shooter', hp: 12, spd: 24, dmg: 4, r: 5, xp: 2, spr: 'cliente', cols: ['#f1c27d', '#9b59b6', '#ffffff'], shoot: { rng: 105, cd: 2.4, spd: 90, dmg: 6 } },
   piccione:  { name: 'PICCIONE', beh: 'swarm', hp: 3, spd: 78, dmg: 3, r: 4, xp: 1, spr: 'piccione', fly: true, cols: ['#8a8a96', '#4a9a5a', '#ff9933'] },
-  capocameriere: { name: 'CAPOCAMERIERE', beh: 'elite', hp: 380, spd: 30, dmg: 12, r: 10, xp: 0, spr: 'capocameriere', mini: true, kbRes: 0.2, cols: ['#f4f4fa', '#d62828', '#ffd84a', '#c8c8d4'] },
-  maitre:    { name: 'IL MAÎTRE FURIOSO', beh: 'boss', hp: 1600, spd: 36, dmg: 14, r: 13, xp: 0, spr: 'maitre', boss: true, kbRes: 0, summon: 'cameriere', cols: ['#1a1a28', '#d62828', '#ffffff', '#f1c27d'] },
+  capocameriere: { name: 'CAPOCAMERIERE', beh: 'elite', hp: 380, spd: 30, dmg: 10, r: 10, xp: 0, spr: 'capocameriere', mini: true, kbRes: 0.2, cols: ['#f4f4fa', '#d62828', '#ffd84a', '#c8c8d4'] },
+  maitre:    { name: 'IL MAÎTRE FURIOSO', beh: 'boss', hp: 1600, spd: 36, dmg: 11, r: 13, xp: 0, spr: 'maitre', boss: true, kbRes: 0, summon: 'cameriere', cols: ['#1a1a28', '#d62828', '#ffffff', '#f1c27d'] },
   // --- Risaia di Montagna ----------------------------------------------------
   cervo:    { name: 'CERVO SELVATICO', beh: 'charger', hp: 16, spd: 32, dmg: 8, r: 6, xp: 2, spr: 'cervo', cols: ['#a86a3a', '#f1e4c8', '#5a3a1e'], charge: { range: 100, wind: 0.5, spd: 175, dur: 0.5, cd: 2.2 } },
   lupo:     { name: 'LUPO AFFAMATO', beh: 'orbiter', hp: 10, spd: 58, dmg: 6, r: 4.5, xp: 2, spr: 'lupo', cols: ['#5a5a66', '#e8e8f0', '#1a1a1a'] },
   orso:     { name: 'ORSO AFFAMATO', beh: 'chaser', hp: 46, spd: 20, dmg: 11, r: 7.5, xp: 3, spr: 'orso', kbRes: 0.35, cols: ['#5a3a1e', '#8a5a2e', '#f1e4c8'] },
-  lupoalfa: { name: 'LUPO ALFA', beh: 'elite', hp: 480, spd: 34, dmg: 14, r: 10, xp: 0, spr: 'lupoalfa', mini: true, kbRes: 0.22, summon: 'lupo', cols: ['#3a3a44', '#e8e8f0', '#1a1a1a', '#c8c8d4'] },
-  grandorso: { name: 'IL GRANDE ORSO DELLA RISAIA', beh: 'boss', hp: 2100, spd: 32, dmg: 17, r: 15, xp: 0, spr: 'grandorso', boss: true, kbRes: 0, summon: 'lupo', ph2: 'RUGGITO!', ph3: 'FAME SUPREMA!', cols: ['#4a2e16', '#7a4e26', '#f1e4c8', '#1a1a1a'] },
+  lupoalfa: { name: 'LUPO ALFA', beh: 'elite', hp: 480, spd: 34, dmg: 11, r: 10, xp: 0, spr: 'lupoalfa', mini: true, kbRes: 0.22, summon: 'lupo', cols: ['#3a3a44', '#e8e8f0', '#1a1a1a', '#c8c8d4'] },
+  grandorso: { name: 'IL GRANDE ORSO DELLA RISAIA', beh: 'boss', hp: 2100, spd: 32, dmg: 13, r: 15, xp: 0, spr: 'grandorso', boss: true, kbRes: 0, summon: 'lupo', ph2: 'RUGGITO!', ph3: 'FAME SUPREMA!', cols: ['#4a2e16', '#7a4e26', '#f1e4c8', '#1a1a1a'] },
   // --- Isola del Vulcano -------------------------------------------------------
   serpente: { name: 'SERPENTE VELENOSO', beh: 'snake', hp: 20, spd: 35, dmg: 9, r: 5, xp: 2, spr: 'serpente', cols: ['#4a9a4a', '#8a5ab8', '#d0f050'] },
   calamaro: { name: 'CALAMARO DI FUOCO', beh: 'shooter', hp: 26, spd: 22, dmg: 8, r: 5.5, xp: 3, spr: 'calamaro', cols: ['#ff5a2a', '#ffd84a', '#b01818'], shoot: { rng: 112, cd: 2.6, spd: 95, dmg: 9, pk: PK_FIRE } },
   pollo:    { name: 'POLLO MITRAGLIERE', beh: 'gunner', hp: 22, spd: 30, dmg: 7, r: 5, xp: 3, spr: 'pollo', cols: ['#f4f4fa', '#e8303f', '#ffd84a'], shoot: { rng: 95, cd: 2.9, spd: 125, dmg: 6, gap: 0.12, burst: 4, pk: PK_PELLET } },
-  gallo:    { name: 'GALLO MITRAGLIERE', beh: 'elite', hp: 560, spd: 32, dmg: 15, r: 10, xp: 0, spr: 'gallo', mini: true, kbRes: 0.22, summon: 'pollo', cols: ['#f4f4fa', '#e8303f', '#ffd84a', '#2a2a3a'] },
-  tako:     { name: 'TAKO INFERNO', beh: 'boss', hp: 2600, spd: 34, dmg: 18, r: 15, xp: 0, spr: 'tako', boss: true, kbRes: 0, summon: 'calamaro', bpk: PK_FIRE, ph2: 'ACQUA BOLLENTE!', ph3: 'INFERNO DI TENTACOLI!', cols: ['#d62828', '#ff7a1a', '#ffd84a', '#1a1a28'] },
+  gallo:    { name: 'GALLO MITRAGLIERE', beh: 'elite', hp: 560, spd: 32, dmg: 12, r: 10, xp: 0, spr: 'gallo', mini: true, kbRes: 0.22, summon: 'pollo', cols: ['#f4f4fa', '#e8303f', '#ffd84a', '#2a2a3a'] },
+  tako:     { name: 'TAKO INFERNO', beh: 'boss', hp: 2600, spd: 34, dmg: 14, r: 15, xp: 0, spr: 'tako', boss: true, kbRes: 0, summon: 'calamaro', bpk: PK_FIRE, ph2: 'ACQUA BOLLENTE!', ph3: 'INFERNO DI TENTACOLI!', cols: ['#d62828', '#ff7a1a', '#ffd84a', '#1a1a28'] },
   // --- Città Invasa --------------------------------------------------------------
   scout:      { name: 'ALIENO SCOUT', beh: 'swarm', hp: 8, spd: 85, dmg: 6, r: 4, xp: 2, spr: 'scout', fly: true, cols: ['#5ef05e', '#2a8a3a', '#d8ffd8'] },
   alienlaser: { name: 'ALIENO LASER', beh: 'shooter', hp: 34, spd: 24, dmg: 9, r: 5.5, xp: 3, spr: 'alienlaser', cols: ['#3fa84a', '#8a5ab8', '#5ef05e'], shoot: { rng: 120, cd: 2.4, spd: 130, dmg: 10, pk: PK_LASER } },
   pesante:    { name: 'ALIENO PESANTE', beh: 'chaser', hp: 85, spd: 17, dmg: 14, r: 8, xp: 5, spr: 'pesante', kbRes: 0.3, cols: ['#2a6a3a', '#8a8a96', '#5ef05e'] },
   drone:      { name: 'DRONE VOLANTE', beh: 'orbiter', hp: 28, spd: 60, dmg: 9, r: 4.5, xp: 3, spr: 'drone', fly: true, cols: ['#8a8a96', '#c8c8d4', '#ff4040'] },
-  hunter:     { name: 'SUSHI HUNTER', beh: 'elite', hp: 700, spd: 40, dmg: 16, r: 9, xp: 0, spr: 'hunter', mini: true, kbRes: 0.2, summon: 'scout', cols: ['#4a3a6a', '#8a5ab8', '#5ef05e', '#1a1a28'] },
-  gnamzor:    { name: 'IMPERATORE GNAM-ZOR', beh: 'boss', hp: 3100, spd: 35, dmg: 20, r: 15, xp: 0, spr: 'gnamzor', boss: true, kbRes: 0, summon: 'scout', bpk: PK_LASER, ph2: 'LA FLOTTA HA FAME!', ph3: 'DIVORERÒ QUESTO PIANETA!', cols: ['#3fa84a', '#8a5ab8', '#ffd84a', '#1a1a28'] },
+  hunter:     { name: 'SUSHI HUNTER', beh: 'elite', hp: 700, spd: 40, dmg: 13, r: 9, xp: 0, spr: 'hunter', mini: true, kbRes: 0.2, summon: 'scout', cols: ['#4a3a6a', '#8a5ab8', '#5ef05e', '#1a1a28'] },
+  gnamzor:    { name: 'IMPERATORE GNAM-ZOR', beh: 'boss', hp: 3100, spd: 35, dmg: 15, r: 15, xp: 0, spr: 'gnamzor', boss: true, kbRes: 0, summon: 'scout', bpk: PK_LASER, ph2: 'LA FLOTTA HA FAME!', ph3: 'DIVORERÒ QUESTO PIANETA!', cols: ['#3fa84a', '#8a5ab8', '#ffd84a', '#1a1a28'] },
   // --- Karaguashi (finale) --------------------------------------------------------
   aiutocuoco: { name: 'AIUTO-CUOCO', beh: 'charger', hp: 30, spd: 30, dmg: 10, r: 5, xp: 3, spr: 'aiutocuoco', cols: ['#f4f4fa', '#f1c27d', '#8a6a4a'], charge: { range: 95, wind: 0.45, spd: 180, dur: 0.5, cd: 2.0 } },
   coltello:   { name: 'COLTELLO ANIMATO', beh: 'charger', hp: 14, spd: 40, dmg: 12, r: 4, xp: 2, spr: 'coltello', kbRes: 0.8, cols: ['#c8c8d4', '#8a6a4a', '#ffffff'], charge: { range: 130, wind: 0.3, spd: 230, dur: 0.45, cd: 1.6 } },
   piatto:     { name: 'PIATTO VOLANTE', beh: 'swarm', hp: 12, spd: 95, dmg: 8, r: 4, xp: 2, spr: 'piatto', fly: true, cols: ['#ffffff', '#d62828', '#c8c8d4'] },
-  souschef:   { name: 'SOUS CHEF', beh: 'elite', hp: 850, spd: 36, dmg: 18, r: 10, xp: 0, spr: 'souschef', mini: true, kbRes: 0.2, summon: 'aiutocuoco', cols: ['#f4f4fa', '#f1c27d', '#d62828', '#8a6a4a'] },
-  chef:       { name: 'CHEF KARAGUASHI', beh: 'boss', hp: 3800, spd: 36, dmg: 22, r: 16, xp: 0, spr: 'chef', boss: true, kbRes: 0, summon: 'aiutocuoco', bpk: PK_PLATE, ph2: 'PIATTI ROTANTI E SALSA BOLLENTE!', ph3: 'IL FRAMMENTO DEL RISO SUPREMO È MIO!', cols: ['#f4f4fa', '#d62828', '#f1c27d', '#1a1a28'] },
+  souschef:   { name: 'SOUS CHEF', beh: 'elite', hp: 850, spd: 36, dmg: 14, r: 10, xp: 0, spr: 'souschef', mini: true, kbRes: 0.2, summon: 'aiutocuoco', cols: ['#f4f4fa', '#f1c27d', '#d62828', '#8a6a4a'] },
+  chef:       { name: 'CHEF KARAGUASHI', beh: 'boss', hp: 3800, spd: 36, dmg: 17, r: 16, xp: 0, spr: 'chef', boss: true, kbRes: 0, summon: 'aiutocuoco', bpk: PK_PLATE, ph2: 'PIATTI ROTANTI E SALSA BOLLENTE!', ph3: 'IL FRAMMENTO DEL RISO SUPREMO È MIO!', cols: ['#f4f4fa', '#d62828', '#f1c27d', '#1a1a28'] },
 };
 function hpMul(t) { const m = t / 60; return 1 + 0.12 * m + 0.008 * m * m; }
 function spawnEnemy(type, x, y) {
@@ -2644,6 +2660,9 @@ function spawnEnemy(type, x, y) {
   e.fire = 0.6 + Math.random() * 1.6; e.orbT = -9; e.anim = Math.random() * 6; e.face = 0; e.dir = Math.random() < 0.5 ? 1 : -1;
   e.cd = 0.3 + Math.random() * 1.2; e.mini = !!d.mini; e.boss = !!d.boss; e.phase = 1; e.fly = !!d.fly; e.noSep = false; e.alt = 0; e.atk = 0;
   e.kbRes = d.kbRes === undefined ? 1 : d.kbRes; e.life = 0; e.name = d.name; e.ang = Math.random() * TAU; e.combo = 0;
+  if (d.beh === 'swarm') { // gli sciami attraversano lo schermo puntando verso Giri (con un po' di dispersione)
+    const a = Math.atan2(pl.y - y, pl.x - x) + (Math.random() - 0.5) * 0.7; e.dx = Math.cos(a); e.dy = Math.sin(a);
+  }
   return e;
 }
 function spawnRingPos(R, out) { const a = Math.random() * TAU; out.x = pl.x + Math.cos(a) * R; out.y = pl.y + Math.sin(a) * R * 0.9; }
@@ -2829,7 +2848,7 @@ function aiSnake(e, dt, d, ux, uy) {
   const mx = ux - uy * wob, my = uy + ux * wob, l = Math.hypot(mx, my) || 1;
   moveE(e, mx / l, my / l, e.spd, dt);
   e.fire -= dt;
-  if (e.fire <= 0) { e.fire = 1.5 + Math.random() * 0.5; addPoison(e.x, e.y + 2, 8, 2.6, Math.max(3, e.dmg * 0.55)); }
+  if (e.fire <= 0) { e.fire = 2.0 + Math.random() * 0.6; addPoison(e.x, e.y + 2, 8, 2.0, Math.max(3, e.dmg * 0.4)); }
 }
 // Pollo mitragliere: si apposta e spara raffiche brevi, con rinculo buffo
 function aiGunner(e, dt, d, ux, uy) {
@@ -2955,7 +2974,7 @@ function updateEnemies(dt) {
     if (!e.fly) resolveObs(e, e.r * 0.8);
     // contatto con Giri (i nemici confusi non fanno male)
     if (e.conf <= 0 && !pl.dead && e.touch <= 0 && d < e.r + pl.r) {
-      const boost = e.st === 2 && (beh === 'charger' || beh === 'elite' || beh === 'boss') ? 1.5 : 1;
+      const boost = e.st === 2 ? (beh === 'charger' ? 1.5 : (beh === 'elite' || beh === 'boss') ? 1.3 : 1) : 1;
       hurtPlayer(e.dmg * run.dmgMul * boost, e.x, e.y);
       e.touch = e.boss || e.mini ? 0.7 : 0.5;
     }
@@ -3043,7 +3062,7 @@ function spawnMini(idx) {
 function startBossFight() {
   run.bossStarted = true;
   // la folla fugge: i nemici normali si dissolvono lasciando chicchi
-  for (let i = 0; i < E.length; i++) { const e = E[i]; if (e.alive && !e.boss && !e.mini) { e.alive = false; if (Math.random() < 0.5) addGem(e.x, e.y, e.def.xp); burst(e.x, e.y, 3, e.def.cols, 50, 0.4, 2, 60); } }
+  for (let i = 0; i < E.length; i++) { const e = E[i]; if (e.alive && !e.boss && !e.mini) { e.alive = false; if (Math.random() < 0.15) addGem(e.x, e.y, e.def.xp); burst(e.x, e.y, 3, e.def.cols, 50, 0.4, 2, 60); } }
   for (let i = 0; i < PR.length; i++) if (!PR[i].fr) PR[i].alive = false;
   spawnRingPos(210, _sp);
   const e = spawnEnemy(run.st.boss, _sp.x, _sp.y);
@@ -3069,7 +3088,7 @@ function updateSpawner(dt) {
   for (let k = 0; k < st.spawns.length; k++) {
     const s = st.spawns[k], a = s.a * sc, b = s.b * sc;
     if (t < a || t >= b) continue;
-    const rate = lerp(s.r0, s.r1, (t - a) / (b - a)) * dens;
+    const u = (t - a) / (b - a), rate = lerp(s.r0, s.r1, Math.pow(u, 1.5)) * dens; // curva: morbida all'inizio, orda nel finale
     run.acc[k] += rate * dt;
     while (run.acc[k] >= 1) { run.acc[k] -= 1; if (run.nAlive < cap) spawnOne(s.type); }
   }
@@ -3394,7 +3413,7 @@ function applyCard(c) {
   }
 }
 function openLevelUp() {
-  G.cards = buildOffers(3); G.banishMode = false;
+  G.cards = buildOffers(3); G.banishMode = false; G.uiLock = 0.4;
   Sound.sfx('levelup');
   setState('LEVEL_UP');
 }
@@ -3421,12 +3440,13 @@ function screenLevelUp(c) {
   if (run.rer > 0) button(c, 'rer', 74, by, 112, 20, 'RILANCIA (' + run.rer + ')');
   if (run.ban > 0) button(c, 'ban', 198, by, 112, 20, (G.banishMode ? 'ANNULLA' : 'BANDISCI (' + run.ban + ')'));
   uiFocusSound();
+  if (G.uiLock > 0) { Input.endFrame(); return; } // le carte si possono scegliere solo dopo un attimo
   let a = uiProcess(), pick = -1;
   if (Input.pressed.sel1) pick = 0; else if (Input.pressed.sel2) pick = 1; else if (Input.pressed.sel3) pick = 2;
   if (Input.pressed.reroll && run.rer > 0) a = { id: 'rer', kind: 'enter' };
   if (Input.pressed.banish && run.ban > 0) a = { id: 'ban', kind: 'enter' };
   if (pick < 0 && a && a.id.startsWith('card')) pick = parseInt(a.id.slice(4), 10);
-  if (a && a.id === 'rer') { run.rer--; G.cards = buildOffers(3); Sound.sfx('pick'); UI.focus = 0; }
+  if (a && a.id === 'rer') { run.rer--; G.cards = buildOffers(3); Sound.sfx('pick'); UI.focus = 0; G.uiLock = 0.3; }
   else if (a && a.id === 'ban') { G.banishMode = !G.banishMode; Sound.sfx('click'); }
   else if (pick >= 0 && pick < G.cards.length) {
     if (G.banishMode) {
@@ -3489,10 +3509,11 @@ function screenChest(c, dt) {
   }
   const done = ch.t > 1.5 + ch.res.length * 0.4 + 0.3;
   if (done) {
-    button(c, 'ok', 144, 192, 96, 18, 'CONTINUA');
+    button(c, 'ok', 112, 190, 160, 22, 'CONTINUA');
     uiFocusSound();
     const a = uiProcess();
-    if (a && (a.id === 'ok' || a.kind === 'enter' || a.kind === 'tap')) { setState('PLAYING'); pl.inv = Math.max(pl.inv, 0.8); Sound.sfx('confirm'); }
+    // su touch basta un tocco ovunque, da tastiera Invio/Spazio
+    if ((a && (a.id === 'ok' || a.kind === 'enter')) || Pointer.tapped || Input.pressed.confirm) { setState('PLAYING'); pl.inv = Math.max(pl.inv, 0.8); Sound.sfx('confirm'); }
   }
 }
 
@@ -3870,7 +3891,7 @@ function screenVictory(c, dt) {
   Music.play('title');
   bgMenu(c); uiBegin();
   drawTextShadow(c, 'STAGE COMPLETATO!', VW / 2, 8, '#ffd84a', '#7a3a10', 3, 'center');
-  drawText(c, 'IL MAÎTRE FURIOSO È STATO SERVITO!', VW / 2, 36, '#ffffff', 1, 'center');
+  drawText(c, run.st.bossName + ' È STATO SERVITO!', VW / 2, 36, '#ffffff', 1, 'center');
   c.save(); c.translate(VW / 2 - 70, 58); c.scale(2, 2); drawGiri(c, 0, 0, { fx: 0, fy: 1, anim: G.t, moving: Math.floor(G.t * 3) % 2 === 0, noShadow: true }); c.restore();
   c.drawImage(ISP.chicco.a, VW / 2 + 56, 40 + Math.round(Math.sin(G.t * 4) * 2), ISP.chicco.w * 2, ISP.chicco.h * 2);
   for (let i = 0; i < 12; i++) { const a = G.t * 1.5 + i / 12 * TAU; fillR(c, VW / 2 + 70 + Math.cos(a) * 24, 56 + Math.sin(a) * 18, 2, 2, i % 2 ? '#ffd84a' : '#ffffff'); }
@@ -4100,6 +4121,8 @@ function frame(ts) {
     if (G.state === 'PLAYING') { if (fps < 46) G.quality = Math.max(0.2, G.quality - 0.2); else if (fps > 56) G.quality = Math.min(1, G.quality + 0.08); }
   }
   G.t += dt;
+  if (G.uiLock > 0) G.uiLock -= dt;
+  Touch.sync();
   if (G.toast) { G.toast.t -= dt; if (G.toast.t <= 0) G.toast = null; }
   if (G.banner) { G.banner.t -= dt; if (G.banner.t <= 0) G.banner = null; }
   let stepped = false;
